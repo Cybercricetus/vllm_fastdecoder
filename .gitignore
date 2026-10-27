@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# virtualenv (uv venv)
+.venv/
+
+# experiment outputs: results/<timestamp>/, results/correctness/, quick*.jsonl ...
+# To commit a run for the report, move it to results/final/ (kept below).
+results/*
+!results/final/
+*.log
+
+# compiled kernel if built in-tree (JIT builds go to ~/.cache/torch_extensions)
+*.so
+
+# container images
+*.sif
+
+# secrets (HF_TOKEN etc.)
+.env
+
+# editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store

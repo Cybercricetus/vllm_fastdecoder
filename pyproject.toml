@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vllm-fastdecode"
+version = "0.1.0"
+description = "FastDecode-style CPU KV tier + CPU attention for vLLM (prototype)"
+requires-python = ">=3.10"
+dependencies = ["vllm==0.31.0"]
+
+[project.optional-dependencies]
+eval = ["datasets", "scipy", "numpy", "pandas", "pytest", "ninja"]
+
+[project.entry-points."vllm.general_plugins"]
+fastdecode = "fastdecode:register"
+
+[tool.setuptools]
+packages = ["fastdecode"]
+
+[tool.setuptools.package-data]
+fastdecode = ["csrc/*.cpp"]
