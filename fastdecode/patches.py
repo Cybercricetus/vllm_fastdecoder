@@ -13,7 +13,7 @@ import copy
 import functools
 import logging
 
-from fastdecode import config
+from fastdecode import config, verify
 
 logger = logging.getLogger("fastdecode")
 
@@ -103,6 +103,18 @@ def apply_engine_core_patch() -> None:
             problems.append("no speculative decoding")
         if vllm_config.parallel_config.world_size > 1:
             problems.append("tensor/pipeline parallel size 1")
+        if config.sr_enabled():
+            if not vllm_config.parallel_config.enable_dbo:
+                problems.append("enable_dbo=True (FASTDECODE_SR=1)")
+            if not vllm_config.use_v2_model_runner:
+                problems.append("VLLM_USE_V2_MODEL_RUNNER=1 (FASTDECODE_SR=1)")
+            if not vllm_config.model_config.enforce_eager:
+                # micro-batched steps hand off mid-layer; never capture them
+                problems.append("enforce_eager=True (FASTDECODE_SR=1)")
+            if verify.enabled():
+                # the verifier assumes one batch per step and is skipped in
+                # split steps, so its write table would go stale
+                problems.append("FASTDECODE_VERIFY unset (FASTDECODE_SR=1)")
         if problems:
             raise ValueError(
                 "FastDecode prototype requires: " + "; ".join(problems)

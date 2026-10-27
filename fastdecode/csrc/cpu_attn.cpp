@@ -529,8 +529,12 @@ bool has_avx2() {
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("decode_attn", &decode_attn, "FastDecode CPU partial decode attention");
-  m.def("store_kv", &store_kv, "FastDecode CPU KV store");
+  // Neither kernel touches Python objects. Dropping the GIL lets the other S/R
+  // micro-batch thread keep launching GPU work while they run.
+  m.def("decode_attn", &decode_attn, "FastDecode CPU partial decode attention",
+        py::call_guard<py::gil_scoped_release>());
+  m.def("store_kv", &store_kv, "FastDecode CPU KV store",
+        py::call_guard<py::gil_scoped_release>());
   m.def("set_num_threads", &set_num_threads);
   m.def("get_num_threads", &get_num_threads);
   m.def("has_avx2", &has_avx2);

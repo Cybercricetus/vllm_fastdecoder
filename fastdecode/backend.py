@@ -30,7 +30,7 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 
-from fastdecode import config, cpu_ops, state, verify
+from fastdecode import config, cpu_ops, sr, state, verify
 from fastdecode.plan import DevicePlan, build_host_plan, to_device
 
 logger = logging.getLogger("fastdecode")
@@ -230,7 +230,8 @@ class FastDecodeImpl(FlashAttentionImpl):
         if attn_metadata is None:  # profiling run
             return output.fill_(0)
         plan = getattr(attn_metadata, "fd_plan", None)
-        vf = _VERIFIER
+        overlap = sr.active()
+        vf = None if overlap else _VERIFIER  # the verifier assumes one batch per step
         if vf is not None and not (
             state.STORE is not None and key is not None and vf.selected(layer.layer_name)
         ):
@@ -247,14 +248,17 @@ class FastDecodeImpl(FlashAttentionImpl):
             )
             if vf is not None:
                 vf.record(layer.layer_name, key, attn_metadata)
+            if overlap:
+                sr.yield_to_other()  # no CPU work, but the handoff must stay paired
             return out
-        out = self._forward_split(layer, query, key, value, kv_cache, plan, output)
+        out = self._forward_split(layer, query, key, value, kv_cache, plan, output, overlap)
         if vf is not None:
             vf.record(layer.layer_name, key, attn_metadata)
             vf.check(self, layer, query, key, value, kv_cache, attn_metadata, output)
         return out
 
-    def _forward_split(self, layer, query, key, value, kv_cache, dp: DevicePlan, output):
+    def _forward_split(self, layer, query, key, value, kv_cache, dp: DevicePlan, output,
+                       overlap: bool = False):
         hp = dp.host
         store = state.STORE
         assert store is not None
@@ -263,7 +267,7 @@ class FastDecodeImpl(FlashAttentionImpl):
         fa = OPS.fa
         H, D = self.num_heads, self.head_size
         key_cache, value_cache = kv_cache.transpose(1, 2).split(D, dim=-1)
-        st = state.staging()
+        st = state.staging(sr.ubatch_id() if overlap else 0)
 
         # 1) KV writes for GPU-resident slots (CPU slots are -1 -> skipped)
         if self.kv_sharing_target_layer_name is None:
@@ -340,15 +344,31 @@ class FastDecodeImpl(FlashAttentionImpl):
             output.index_copy_(0, dp.f_tok, o_f)
 
         # 4) CPU side: store new K/V, then partial attention over CPU KV
-        staged.synchronize()
         ext = cpu_ops.load_ext()
-        if do_kv:
-            ext.store_kv(hk, hv, hp.cpu_w_slot, k_cpu, v_cpu)
-        if ns:
+
+        def cpu_part():
+            staged.synchronize()
+            if do_kv:
+                ext.store_kv(hk, hv, hp.cpu_w_slot, k_cpu, v_cpu)
+            if not ns:
+                return None, None
             ho = st.get("o", (ns, H, D), query.dtype)
             hl = st.get("lse", (H, ns), torch.float32)
             ext.decode_attn(hq, k_cpu, v_cpu, hp.s_cpu_bt, hp.s_cpu_lens,
                             float(self.scale), ho, hl)
+            return ho, hl
+
+        if overlap:
+            # S/R: the other micro-batch's GPU work (out-proj, MLP, next QKV)
+            # runs while this micro-batch's CPU part does. The buffers in `st`
+            # belong to this micro-batch, and its thread does not touch them
+            # again until the job is done.
+            job = sr.submit(cpu_part) if (do_kv or ns) else None
+            sr.yield_to_other()
+            ho, hl = job.result() if job is not None else (None, None)
+        else:
+            ho, hl = cpu_part()
+        if ns:
             o_cpu = ho.to(query.device, non_blocking=True)
             lse_cpu = hl.to(query.device, non_blocking=True)
             merged = torch.empty_like(o_gpu)

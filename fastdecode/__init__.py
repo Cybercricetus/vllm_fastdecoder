@@ -24,4 +24,8 @@ def register() -> None:
         from fastdecode.patches import apply_engine_core_patch
 
         apply_engine_core_patch()
+        if config.sr_enabled():
+            from fastdecode import sr
+
+            sr.apply_worker_patches()
         logging.getLogger("fastdecode").info("FastDecode plugin active")

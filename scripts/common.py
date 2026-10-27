@@ -34,6 +34,24 @@ ARMS = {
     "fd_c0": dict(attention_backend="CUSTOM", env={}),
     # FastDecode with the CPU tier (size from --cpu-kv-gib)
     "fastdecode": dict(attention_backend="CUSTOM", env={"FASTDECODE_CPU_KV_GB": None}),
+    # --- S/R spike (feat/sr-split). Micro-batched steps cannot use CUDA graphs,
+    # so these arms all run eagerly on the V2 model runner; compare
+    # fastdecode_sr with fastdecode_eager to see what the overlap buys.
+    "baseline_eager": dict(
+        attention_backend="FLASH_ATTN", engine=dict(enforce_eager=True),
+        env={"VLLM_USE_V2_MODEL_RUNNER": "1"},
+    ),
+    "fastdecode_eager": dict(
+        attention_backend="CUSTOM", engine=dict(enforce_eager=True),
+        env={"FASTDECODE_CPU_KV_GB": None, "VLLM_USE_V2_MODEL_RUNNER": "1"},
+    ),
+    "fastdecode_sr": dict(
+        attention_backend="CUSTOM",
+        engine=dict(enforce_eager=True, enable_dbo=True, dbo_decode_token_threshold=16,
+                    all2all_backend="deepep_low_latency"),  # see fastdecode/sr.py
+        env={"FASTDECODE_CPU_KV_GB": None, "FASTDECODE_SR": "1",
+             "VLLM_USE_V2_MODEL_RUNNER": "1"},
+    ),
 }
 
 
@@ -65,13 +83,14 @@ def engine_kwargs(args, arm: str) -> dict:
     )
     if spec.get("cudagraph_mode"):
         kw["compilation_config"] = {"cudagraph_mode": spec["cudagraph_mode"]}
+    kw.update(spec.get("engine", {}))
     return kw
 
 
 def arm_env(args, arm: str) -> dict:
     env = dict(os.environ)
     for k in list(env):
-        if k.startswith("FASTDECODE_CPU_BLOCKS") or k.startswith("FASTDECODE_CPU_KV_GB"):
+        if k in ("FASTDECODE_CPU_BLOCKS", "FASTDECODE_CPU_KV_GB", "FASTDECODE_SR"):
             del env[k]
     for k, v in ARMS[arm]["env"].items():
         env[k] = str(args.cpu_kv_gib if v is None else v)

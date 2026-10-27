@@ -171,8 +171,14 @@ def main() -> None:
     ap.add_argument("--arms", default=None,
                     help="comma-separated subset of: baseline, baseline_alt (noise floor), "
                          "baseline_pw (stock, piecewise cudagraphs only), fd_c0 (FastDecode "
-                         "code path, no CPU tier, baseline GPU KV), fastdecode. Default: "
+                         "code path, no CPU tier, baseline GPU KV), fastdecode; S/R spike: "
+                         "baseline_eager, fastdecode_eager, fastdecode_sr. Default: "
                          "baseline,baseline_alt,fastdecode (gsm8k: baseline,fastdecode)")
+    ap.add_argument("--ref", default="baseline", choices=["baseline", "baseline_eager"],
+                    help="stock-vLLM arm everything is compared with; baseline_alt (the noise "
+                         "floor) reruns it with other batching. Use baseline_eager for the "
+                         "eager S/R spike arms, so eager-vs-compiled differences are not "
+                         "blamed on FastDecode")
     ap.add_argument("--reuse", default="",
                     help="comma-separated arms whose saved outputs in --outdir are reused "
                          "if their settings match, e.g. --reuse baseline,baseline_alt to "
@@ -183,29 +189,32 @@ def main() -> None:
 
     default = "baseline,baseline_alt,fastdecode" if args.task == "tokens" else "baseline,fastdecode"
     names = [a.strip() for a in (args.arms or default).split(",") if a.strip()]
-    known = {"baseline", "baseline_alt", "baseline_pw", "fd_c0", "fastdecode"}
+    known = {"baseline", "baseline_alt", "baseline_pw", "fd_c0", "fastdecode",
+             "baseline_eager", "fastdecode_eager", "fastdecode_sr"}
     if set(names) - known:
         ap.error(f"unknown arms {sorted(set(names) - known)}")
-    if "baseline" not in names:
-        names.insert(0, "baseline")
+    ref = args.ref
+    names = [ref] + [n for n in names if n != ref]
     # settings that change an arm's outputs; a saved run is reused only if they match
     same = ("model", "max_model_len", "task", "limit", "max_tokens", "topk", "gpu_mem_util")
 
     reuse = {a.strip() for a in args.reuse.split(",") if a.strip()}
     runs = {}
     for name in names:
-        arm = "baseline" if name == "baseline_alt" else name
+        arm = ref if name == "baseline_alt" else name
         a = dict(vars(args))
         mns = None
         if name == "baseline_alt":
             a["gpu_kv_gib"] = args.alt_gpu_kv_gib
             mns = max(1, args.max_num_seqs // 4)
-        elif arm != "fastdecode":
+        elif not arm.startswith("fastdecode"):
             a["gpu_kv_gib"] = args.baseline_gpu_kv_gib
         sig = {k: a[k] for k in same}
         sig.update(arm=name, gpu_kv_gib=a["gpu_kv_gib"], max_num_seqs=mns or args.max_num_seqs)
-        if arm == "fastdecode":
+        if arm.startswith("fastdecode"):
             sig.update(cpu_kv_gib=args.cpu_kv_gib)
+        if name == "baseline_alt" and ref != "baseline":
+            sig.update(ref=ref)
         path = out / f"{args.task}_{name}.json"
         if name in reuse and path.exists():
             saved = json.loads(path.read_text())
@@ -222,28 +231,33 @@ def main() -> None:
         runs[name] = res["outputs"]
 
     if args.task == "tokens":
-        n = len(runs["baseline"])
+        n = len(runs[ref])
         rows = {}
         for name in names[1:]:
-            e, c, f, divs = compare_tokens(runs["baseline"], runs[name])
+            e, c, f, divs = compare_tokens(runs[ref], runs[name])
             rows[name] = (e, c, f)
             md = sorted(divs)[len(divs) // 2] if divs else None
-            print(f"{name:>13} vs baseline: exact {e}/{n}, close {c}, FAIL {f}, "
+            print(f"{name:>16} vs {ref}: exact {e}/{n}, close {c}, FAIL {f}, "
                   f"median first divergence at token {md}")
-        if "fastdecode" in rows and "baseline_alt" in rows:
-            (e0, _, f0), (e1, _, f1) = rows["baseline_alt"], rows["fastdecode"]
+        for fd in [r for r in rows if r.startswith("fastdecode")]:
+            if "baseline_alt" not in rows:
+                break
+            (e0, _, f0), (e1, _, f1) = rows["baseline_alt"], rows[fd]
             p = fisher_two_sided(e1, n - e1, e0, n - e0)
-            print(f"\nexact-match rate fastdecode {e1 / n:.3f} vs noise floor {e0 / n:.3f} "
+            print(f"\nexact-match rate {fd} {e1 / n:.3f} vs noise floor {e0 / n:.3f} "
                   f"(Fisher p={p:.3g})")
             ok = f1 == 0 and (e1 >= e0 or p > 0.05)
-            print("PASS: FastDecode is within vLLM's own batch-variance noise." if ok else
-                  "CHECK: FastDecode deviates more than the noise floor -- investigate.")
+            print(f"PASS: {fd} is within vLLM's own batch-variance noise." if ok else
+                  f"CHECK: {fd} deviates more than the noise floor -- investigate.")
     else:
         _, answers = load_prompts("gsm8k", args.limit)
-        s = gsm8k_stats(runs["baseline"], runs["fastdecode"], answers, args.margin)
+        fd = next((n for n in names if n.startswith("fastdecode")), None)
+        if fd is None:
+            raise SystemExit("--task gsm8k needs a fastdecode* arm")
+        s = gsm8k_stats(runs[ref], runs[fd], answers, args.margin)
         print(json.dumps(s, indent=2))
         eq = s["ci90"][0] > -args.margin and s["ci90"][1] < args.margin
-        print(f"accuracy baseline {s['acc_base']:.4f} vs fastdecode {s['acc_fd']:.4f}; "
+        print(f"accuracy {ref} {s['acc_base']:.4f} vs {fd} {s['acc_fd']:.4f}; "
               f"McNemar p={s['p_mcnemar']:.3g}; 90% CI of diff [{s['ci90'][0]:+.4f}, "
               f"{s['ci90'][1]:+.4f}] -> {'EQUIVALENT' if eq else 'not shown equivalent'} "
               f"within +/-{args.margin} (TOST p={s['p_tost']:.3g})")
