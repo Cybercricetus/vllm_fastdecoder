@@ -30,10 +30,13 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadataBuilder,
 )
 
-from fastdecode import config, cpu_ops, state
+from fastdecode import config, cpu_ops, state, verify
 from fastdecode.plan import DevicePlan, build_host_plan, to_device
 
 logger = logging.getLogger("fastdecode")
+
+# FASTDECODE_VERIFY=1: slow online self-check (see fastdecode/verify.py)
+_VERIFIER = verify.Verifier() if verify.enabled() else None
 
 
 class _CudaOps:
@@ -138,6 +141,8 @@ class FastDecodeMetadataBuilder(FlashAttentionMetadataBuilder):
         cm = common_attn_metadata
         md: FlashAttentionMetadata = super().build(0, cm, fast_build)
         md.fd_plan = None  # type: ignore[attr-defined]
+        md.fd_num_reqs = cm.num_reqs  # type: ignore[attr-defined]
+        md.fd_seq_cpu = None  # type: ignore[attr-defined]
         store = state.STORE
         if store is None:
             return md
@@ -162,6 +167,7 @@ class FastDecodeMetadataBuilder(FlashAttentionMetadataBuilder):
         # One small D2H sync per step (not per layer).
         bt = bt_dev[:, :width].cpu()
         slots = cm.slot_mapping[:n_tok].cpu()
+        md.fd_seq_cpu = seq  # type: ignore[attr-defined]
         hp = build_host_plan(
             qsl, seq, bt, slots, store.num_gpu_blocks, store.num_cpu_blocks, bs
         )
@@ -224,6 +230,11 @@ class FastDecodeImpl(FlashAttentionImpl):
         if attn_metadata is None:  # profiling run
             return output.fill_(0)
         plan = getattr(attn_metadata, "fd_plan", None)
+        vf = _VERIFIER
+        if vf is not None and not (
+            state.STORE is not None and key is not None and vf.selected(layer.layer_name)
+        ):
+            vf = None
         if plan is None:
             # Stock path. KV update normally runs as a separate op, which this
             # backend disables (forward_includes_kv_cache_update=True).
@@ -231,10 +242,17 @@ class FastDecodeImpl(FlashAttentionImpl):
                 FlashAttentionImpl.do_kv_cache_update(
                     self, layer, key, value, kv_cache, attn_metadata.slot_mapping
                 )
-            return super().forward(
+            out = super().forward(
                 layer, query, key, value, kv_cache, attn_metadata, output
             )
-        return self._forward_split(layer, query, key, value, kv_cache, plan, output)
+            if vf is not None:
+                vf.record(layer.layer_name, key, attn_metadata)
+            return out
+        out = self._forward_split(layer, query, key, value, kv_cache, plan, output)
+        if vf is not None:
+            vf.record(layer.layer_name, key, attn_metadata)
+            vf.check(self, layer, query, key, value, kv_cache, attn_metadata, output)
+        return out
 
     def _forward_split(self, layer, query, key, value, kv_cache, dp: DevicePlan, output):
         hp = dp.host
@@ -282,7 +300,10 @@ class FastDecodeImpl(FlashAttentionImpl):
                     block_table=dp.s_gpu_bt, softcap=self.logits_soft_cap,
                     return_softmax_lse=True, fa_version=self.vllm_flash_attn_version,
                 )
+                # Rows with no GPU tokens: force (0, -inf) so whatever FA left
+                # there cannot leak through the merge (NaN * 0 = NaN).
                 lse_gpu.masked_fill_(dp.s_gpu_empty[None, :], float("-inf"))
+                o_gpu.masked_fill_(dp.s_gpu_empty[:, None, None], 0.0)
             else:
                 o_gpu = torch.zeros_like(qs)
                 lse_gpu = torch.full((H, ns), float("-inf"), device=qs.device)

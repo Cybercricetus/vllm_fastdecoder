@@ -79,15 +79,24 @@ def _cu(lens: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _compact(bt: torch.Tensor, keep: torch.Tensor, offset: int) -> torch.Tensor:
-    """Move the kept block ids of each row to the front (stable), minus offset."""
+def _compact(bt: torch.Tensor, keep: torch.Tensor, offset: int, pad_to: int = 1) -> torch.Tensor:
+    """Move the kept block ids of each row to the front (stable), minus offset.
+
+    The width is rounded up to a multiple of `pad_to` (padding ids are 0).
+    FlashAttention resolves page addresses for a whole KV tile (up to 256
+    tokens = 16 pages) before masking rows past seqused_k, so it reads table
+    entries beyond a row's last block; padding keeps those reads inside the row.
+    """
     if bt.numel() == 0:
-        return torch.zeros(bt.shape[0], 1, dtype=torch.int32)
+        return torch.zeros(bt.shape[0], pad_to, dtype=torch.int32)
     order = torch.sort((~keep).to(torch.int8), dim=1, stable=True).indices
     vals = torch.gather(bt, 1, order) - offset
     kept = torch.gather(keep, 1, order)
     vals = torch.where(kept, vals, torch.zeros_like(vals))
     width = max(1, int(keep.sum(1).max()))
+    width = -(-width // pad_to) * pad_to
+    if width > vals.shape[1]:
+        vals = torch.nn.functional.pad(vals, (0, width - vals.shape[1]))
     return vals[:, :width].to(torch.int32).contiguous()
 
 
@@ -159,7 +168,7 @@ def build_host_plan(
     s_bt, s_gpu, s_cpu, s_tpb = bt[s_req], on_gpu[s_req], on_cpu[s_req], tpb[s_req]
     s_gpu_lens = (s_tpb * s_gpu).sum(1).to(torch.int32)
     s_cpu_lens = (s_tpb * s_cpu).sum(1).to(torch.int32)
-    s_gpu_bt = _compact(s_bt, s_gpu, 0)
+    s_gpu_bt = _compact(s_bt, s_gpu, 0, pad_to=16)
     s_cpu_bt = _compact(s_bt, s_cpu, G)
 
     # F: fresh prefills touching CPU slots

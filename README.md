@@ -51,12 +51,14 @@ vllm serve lmsys/vicuna-7b-v1.5 --attention-backend CUSTOM \
 | `FASTDECODE_CPU_THREADS` | CPU kernel 的线程数，建议设为 P 核数 |
 | `FASTDECODE_MARCH` | JIT 编译用的 `-march`，默认 `native` |
 | `FASTDECODE_STATS=1` | 每 50 步打印一次请求在 GPU/CPU 上的分布 |
+| `FASTDECODE_VERIFY=1` | **调试用，很慢**：在线自检（见下文"排查正确性问题"） |
 
 ## 实验流程（按顺序跑）
 
 `scripts/run_all.sh` 会把下面几步串起来。
 
-1. **`pytest tests`**：CPU kernel、规划器、整个 split/merge 前向流程（GPU 算子用参考实现替代）、block 分配策略、启动时的容量检查，共 50 个测试。
+1. **`pytest tests`**：CPU kernel、规划器、整个 split/merge 前向流程（GPU 算子用参考实现替代）、block 分配策略、启动时的容量检查、在线自检，共 51 个测试。
+   **`scripts/gpu_selftest.py`**：同一个前向流程换成**真实的 CUDA 算子**（FlashAttention、reshape_and_cache_flash、merge_attn_states），不加载模型，模拟连续批处理（请求到达、decode、结束、block 复用），每一步都和"把全部 KV 放在一块大显存里的原生 FlashAttention"逐元素对比。约 1 分钟。
 2. **`scripts/probe_cpu_attn.py`**：测出本机 CPU 每秒最多能贡献多少 token。**先跑这一步**，它决定这台机器能不能看到加速（见下一节）。
 3. **`scripts/check_correctness.py --task tokens`**：故意把 GPU KV 设得很小，强迫大部分 KV 放到 CPU，然后与原生 vLLM 逐 token 对比 greedy 输出，判定标准与 vLLM 自己的测试一致（`check_logprobs_close`）。同时测**噪声底**：原生 vLLM 只改 `max_num_seqs` 时自己和自己的差异。vLLM 不是 batch-invariant 的，而 FastDecode 必然会改变 batch 构成。
 4. **`scripts/bench.py`**：所有组的 GPU KV 大小（`--gpu-kv-gib`）完全相同，fastdecode 组只额外多一个 CPU 层。每个 session 启动一次新引擎，按 ABBA 顺序交替，每组至少 4 个 session。注意原生 vLLM 要求 GPU KV 至少能放下一条 `max_model_len` 的请求（FastDecode 组会把 CPU 层算进去），所以脚本默认 `--max-model-len 1024`。
@@ -64,6 +66,21 @@ vllm serve lmsys/vicuna-7b-v1.5 --attention-backend CUSTOM \
 6. （可选）**`check_correctness.py --task gsm8k`**：任务级正确性。用 McNemar 检验看是否有差异，用 **TOST 等价检验**支撑"没有损失"的结论。**"不显著"不等于"等价"**，只有 TOST 才能支撑这个说法；margin 要事先定好。
 
 可选的实验组：`baseline`（原生，默认 cudagraph）、`baseline_pw`（原生，只用 piecewise cudagraph，这是 FastDecode 强制使用的模式）、`fd_c0`（走 FastDecode 代码路径但 CPU 层为 0，用来测额外开销，应该约等于 `baseline_pw`）、`fastdecode`。
+
+## 排查正确性问题
+
+`check_correctness.py` 报 `CHECK` 时按顺序做：
+
+1. `python scripts/gpu_selftest.py`：真实 CUDA 算子下 split/merge 是否正确。FAIL 说明问题在 backend 的数值路径。
+2. 只重跑 fastdecode 组并打开在线自检（`--reuse` 复用已有的两个 baseline 组结果）：
+   ```bash
+   FASTDECODE_VERIFY=1 python scripts/check_correctness.py --task tokens \
+     --gpu-kv-gib 0.25 --cpu-kv-gib 8 --cpu-threads 10 --limit 128 \
+     --reuse baseline,baseline_alt 2>&1 | tee verify.log
+   grep "VERIFY" verify.log | head -60
+   ```
+   自检完全基于 vLLM 自己的 GPU 端元数据（block table、seq_lens、slot_mapping），不依赖 FastDecode 的执行计划。它检查：执行计划用的 seq_lens 是否与 GPU 一致；每个被 attend 的位置上存的 KV 是否就是最后一次写给这个位置的（能发现写丢、写错位置、block 还在用就被复用）；输出是否与 fp32 参考一致。全 GPU 请求（P 类）的误差就是原生 FlashAttention 的噪声水平，可以作为对照。`FASTDECODE_VERIFY_LAYERS=all` 检查所有层（更慢）。
+3. 自检没有任何 violation 但仍然 FAIL：问题不在 attention。用 `--arms baseline,baseline_pw,fd_c0 --reuse baseline` 分别看 piecewise cudagraph 和 CUSTOM backend 本身（不带 CPU 层）是否已经造成偏差。
 
 ## 什么时候会快
 
@@ -85,7 +102,8 @@ fastdecode/backend.py    Backend / MetadataBuilder / Impl（GPU 与 CPU 分算 +
 fastdecode/plan.py       每步的执行计划（纯 CPU 张量，可单独测试）
 fastdecode/state.py      worker 进程里的 CPU KV 存储和 pinned 缓冲区
 fastdecode/csrc/cpu_attn.cpp  CPU kernel（OpenMP + AVX2/F16C，fp32 累加）
-scripts/                 probe / check_correctness / bench / analyze / run_all.sh
+fastdecode/verify.py     FASTDECODE_VERIFY=1 的在线自检
+scripts/                 probe / gpu_selftest / check_correctness / bench / analyze / run_all.sh
 tests/                   只用 CPU 的测试
 ```
 

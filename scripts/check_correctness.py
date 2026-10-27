@@ -168,41 +168,76 @@ def main() -> None:
                     help="GPU KV for the noise-floor arm: a different size changes how "
                          "requests get batched, which is what FastDecode also does")
     ap.add_argument("--outdir", default="results/correctness")
+    ap.add_argument("--arms", default=None,
+                    help="comma-separated subset of: baseline, baseline_alt (noise floor), "
+                         "baseline_pw (stock, piecewise cudagraphs only), fd_c0 (FastDecode "
+                         "code path, no CPU tier, baseline GPU KV), fastdecode. Default: "
+                         "baseline,baseline_alt,fastdecode (gsm8k: baseline,fastdecode)")
+    ap.add_argument("--reuse", default="",
+                    help="comma-separated arms whose saved outputs in --outdir are reused "
+                         "if their settings match, e.g. --reuse baseline,baseline_alt to "
+                         "rerun only the fastdecode arm")
     args = ap.parse_args()
     out = Path(args.outdir)
     out.mkdir(parents=True, exist_ok=True)
 
+    default = "baseline,baseline_alt,fastdecode" if args.task == "tokens" else "baseline,fastdecode"
+    names = [a.strip() for a in (args.arms or default).split(",") if a.strip()]
+    known = {"baseline", "baseline_alt", "baseline_pw", "fd_c0", "fastdecode"}
+    if set(names) - known:
+        ap.error(f"unknown arms {sorted(set(names) - known)}")
+    if "baseline" not in names:
+        names.insert(0, "baseline")
+    # settings that change an arm's outputs; a saved run is reused only if they match
+    same = ("model", "max_model_len", "task", "limit", "max_tokens", "topk", "gpu_mem_util")
+
+    reuse = {a.strip() for a in args.reuse.split(",") if a.strip()}
     runs = {}
-    plan = [("baseline", None), ("fastdecode", None)]
-    if args.task == "tokens":
-        plan.insert(1, ("baseline_alt", max(1, args.max_num_seqs // 4)))
-    for name, mns in plan:
+    for name in names:
         arm = "baseline" if name == "baseline_alt" else name
         a = dict(vars(args))
+        mns = None
         if name == "baseline_alt":
             a["gpu_kv_gib"] = args.alt_gpu_kv_gib
+            mns = max(1, args.max_num_seqs // 4)
         elif arm != "fastdecode":
             a["gpu_kv_gib"] = args.baseline_gpu_kv_gib
+        sig = {k: a[k] for k in same}
+        sig.update(arm=name, gpu_kv_gib=a["gpu_kv_gib"], max_num_seqs=mns or args.max_num_seqs)
+        if arm == "fastdecode":
+            sig.update(cpu_kv_gib=args.cpu_kv_gib)
+        path = out / f"{args.task}_{name}.json"
+        if name in reuse and path.exists():
+            saved = json.loads(path.read_text())
+            if saved.get("sig") == sig or "sig" not in saved:
+                note = "" if "sig" in saved else " (older file without settings; assuming same command)"
+                print(f"=== {name}: reusing {path}{note}")
+                runs[name] = saved["outputs"]
+                continue
+            print(f"=== {name}: saved run has different settings, rerunning")
         payload = {"args": a, "max_num_seqs": mns}
-        runs[name] = common.run_child(__file__, arm, payload, common.arm_env(args, arm),
-                                      out / f"{args.task}_{name}.json")["outputs"]
+        res = common.run_child(__file__, arm, payload, common.arm_env(args, arm), path)
+        res["sig"] = sig
+        path.write_text(json.dumps(res))
+        runs[name] = res["outputs"]
 
     if args.task == "tokens":
         n = len(runs["baseline"])
         rows = {}
-        for name in ("baseline_alt", "fastdecode"):
+        for name in names[1:]:
             e, c, f, divs = compare_tokens(runs["baseline"], runs[name])
             rows[name] = (e, c, f)
             md = sorted(divs)[len(divs) // 2] if divs else None
             print(f"{name:>13} vs baseline: exact {e}/{n}, close {c}, FAIL {f}, "
                   f"median first divergence at token {md}")
-        (e0, _, f0), (e1, _, f1) = rows["baseline_alt"], rows["fastdecode"]
-        p = fisher_two_sided(e1, n - e1, e0, n - e0)
-        print(f"\nexact-match rate fastdecode {e1 / n:.3f} vs noise floor {e0 / n:.3f} "
-              f"(Fisher p={p:.3g})")
-        ok = f1 == 0 and (e1 >= e0 or p > 0.05)
-        print("PASS: FastDecode is within vLLM's own batch-variance noise." if ok else
-              "CHECK: FastDecode deviates more than the noise floor -- investigate.")
+        if "fastdecode" in rows and "baseline_alt" in rows:
+            (e0, _, f0), (e1, _, f1) = rows["baseline_alt"], rows["fastdecode"]
+            p = fisher_two_sided(e1, n - e1, e0, n - e0)
+            print(f"\nexact-match rate fastdecode {e1 / n:.3f} vs noise floor {e0 / n:.3f} "
+                  f"(Fisher p={p:.3g})")
+            ok = f1 == 0 and (e1 >= e0 or p > 0.05)
+            print("PASS: FastDecode is within vLLM's own batch-variance noise." if ok else
+                  "CHECK: FastDecode deviates more than the noise floor -- investigate.")
     else:
         _, answers = load_prompts("gsm8k", args.limit)
         s = gsm8k_stats(runs["baseline"], runs["fastdecode"], answers, args.margin)

@@ -398,3 +398,55 @@ def test_capacity_check_counts_cpu_tier(monkeypatch):
     monkeypatch.setenv("FASTDECODE_CPU_KV_GB", "2")  # +256 blocks
     patches._apply_capacity_check_patch()
     kvu._check_enough_kv_cache_memory(gpu_mem, get_needed, 2048, lambda m: 0)  # passes now
+
+
+def test_verifier_clean_run_and_detects_corruption(monkeypatch):
+    """FASTDECODE_VERIFY's online check: silent on a correct step, loud when the
+    CPU-tier KV or the output is corrupted."""
+    from fastdecode import verify
+
+    G, C, H, KVH, D, dtype = 10, 20, 8, 2, 64, torch.float16
+    sc = _scenario(REQS, G, C, H, KVH, D, dtype, 5)
+    state.STORE = state.CpuKVStore(
+        num_gpu_blocks=G, num_cpu_blocks=C, block_size=BS, num_kv_heads=KVH,
+        head_size=D, dtype=dtype, k={"l0": sc.cpu_k}, v={"l0": sc.cpu_v},
+    )
+    R, n_tok = sc.bt.shape[0], int(sc.qsl[-1])
+    md = SimpleNamespace(
+        query_start_loc=sc.qsl, seq_lens=sc.seq_lens, slot_mapping=sc.slots,
+        block_table=sc.bt, num_actual_tokens=n_tok, fd_num_reqs=R,
+        fd_seq_cpu=sc.seq_lens,
+    )
+    vf = verify.Verifier()
+    # fingerprint the context KV as if earlier steps had written it
+    ctx_slots, ctx_k, ctx_qsl, ctx_lens = [], [], [0], []
+    for (ctx, _, blocks) in REQS:
+        for p in range(ctx):
+            s = blocks[p // BS] * BS + p % BS
+            ctx_slots.append(s)
+            ctx_k.append(sc.ref_k[s // BS, s % BS])
+        ctx_qsl.append(ctx_qsl[-1] + ctx)
+        ctx_lens.append(ctx)
+    prev = SimpleNamespace(
+        query_start_loc=torch.tensor(ctx_qsl), seq_lens=torch.tensor(ctx_lens),
+        slot_mapping=torch.tensor(ctx_slots), num_actual_tokens=len(ctx_slots),
+        fd_num_reqs=R,
+    )
+    vf.record("l0", torch.stack(ctx_k), prev)
+
+    hp = plan.build_host_plan(sc.qsl, sc.seq_lens, sc.bt, sc.slots, G, C, BS)
+    dp = plan.to_device(hp, sc.bt, "cpu")
+    impl = _impl(H, KVH, D, sc.scale)
+    layer = SimpleNamespace(layer_name="l0", _k_scale=None, _v_scale=None)
+    out = torch.full_like(sc.query, float("nan"))
+    impl._forward_split(layer, sc.query, sc.key, sc.value, sc.kv_cache, dp, out)
+    vf.record("l0", sc.key, md)
+    vf.check(impl, layer, sc.query, sc.key, sc.value, sc.kv_cache, md, out)
+    assert vf.total_bad == 0, vf.cnt
+
+    # corrupt one CPU-resident context position of request 5 (block 16 -> CPU idx 6)
+    sc.cpu_k[16 - G, :, 1] += 1.0
+    out[0] += 0.5  # and the output row of request 0
+    vf.check(impl, layer, sc.query, sc.key, sc.value, sc.kv_cache, md, out)
+    assert vf.cnt["ksum_mismatch"] >= 1
+    assert vf.cnt["out_mismatch"] >= 1

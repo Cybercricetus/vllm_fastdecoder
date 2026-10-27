@@ -16,6 +16,9 @@ mkdir -p "$OUT"
 echo "### 0. unit tests (CPU only)"
 python -m pytest tests -q
 
+echo "### 0b. split attention with the real CUDA ops (no model)"
+python scripts/gpu_selftest.py | tee "$OUT/gpu_selftest.txt"
+
 echo "### 1. CPU attention probe (decides whether a speed-up is possible)"
 python scripts/probe_cpu_attn.py --threads "$THREADS" --ctx 512 --batch 64 | tee "$OUT/probe.txt"
 
