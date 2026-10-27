@@ -69,6 +69,19 @@ class CpuOps:
             lses.append(l)
         out = torch.cat(outs).to(q.dtype)
         lse = torch.cat(lses, dim=1).float()
+        if block_table is not None and max_seqlen_q == 1:
+            # Mimic vLLM's FA2 (paged, split-KV kernel) on rows with
+            # seqused_k == 0: the early exit writes +inf at the *padded*
+            # [batch, heads] offset instead of its own [heads, total_q] slots,
+            # clobbering other rows' LSE and leaving its own uninitialized.
+            H = q.shape[1]
+            flat = lse.view(-1)
+            for b in range(n):
+                if int(seqused_k[b]) == 0:
+                    lse[:, b] = 42.0
+            for b in range(n):
+                if int(seqused_k[b]) == 0:
+                    flat[b * H:(b + 1) * H] = float("inf")
         return (out, lse) if return_softmax_lse else out
 
     @staticmethod

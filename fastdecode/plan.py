@@ -211,10 +211,12 @@ class DevicePlan:
     p_seqlens: torch.Tensor
     p_bt: torch.Tensor  # [nP, W] int32 (rows of the batch block table)
     s_tok: torch.Tensor
-    s_cu: torch.Tensor  # arange(nS + 1) int32
-    s_gpu_bt: torch.Tensor
-    s_gpu_lens: torch.Tensor
-    s_gpu_empty: torch.Tensor  # [nS] bool
+    # GPU partial of split decodes: only the S rows that have GPU tokens
+    # (FlashAttention must never see a row with seqused_k == 0, see backend)
+    s_gpu_rows: torch.Tensor  # [nG] int64, indices into the S rows
+    s_gpu_cu: torch.Tensor  # arange(nG + 1) int32
+    s_gpu_bt: torch.Tensor  # [nG, Wg] int32
+    s_gpu_lens: torch.Tensor  # [nG] int32, all > 0
     f_tok: torch.Tensor
     f_cu: torch.Tensor
 
@@ -224,6 +226,7 @@ def to_device(hp: HostPlan, block_table_dev: torch.Tensor, device) -> DevicePlan
         return t.to(device, non_blocking=False)
 
     p_req = d(hp.p_req)
+    g_rows = torch.nonzero(hp.s_gpu_lens > 0).flatten()
     return DevicePlan(
         host=hp,
         gpu_slot_mapping=d(hp.gpu_slot_mapping),
@@ -233,10 +236,10 @@ def to_device(hp: HostPlan, block_table_dev: torch.Tensor, device) -> DevicePlan
         p_seqlens=d(hp.p_seqlens),
         p_bt=block_table_dev.index_select(0, p_req) if hp.p_req.numel() else block_table_dev[:0],
         s_tok=d(hp.s_tok),
-        s_cu=torch.arange(hp.n_s + 1, dtype=torch.int32, device=device),
-        s_gpu_bt=d(hp.s_gpu_bt),
-        s_gpu_lens=d(hp.s_gpu_lens),
-        s_gpu_empty=d(hp.s_gpu_lens == 0),
+        s_gpu_rows=d(g_rows),
+        s_gpu_cu=torch.arange(g_rows.numel() + 1, dtype=torch.int32, device=device),
+        s_gpu_bt=d(hp.s_gpu_bt[g_rows]),
+        s_gpu_lens=d(hp.s_gpu_lens[g_rows]),
         f_tok=d(hp.f_tok),
         f_cu=d(hp.f_cu),
     )

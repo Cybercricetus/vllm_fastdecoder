@@ -291,22 +291,29 @@ class FastDecodeImpl(FlashAttentionImpl):
 
         # 3) GPU attention that does not need the CPU (overlaps with step 4)
         if ns:
+            # Rows without GPU tokens keep (out=0, lse=-inf): the merge then
+            # takes the CPU partial alone.
+            o_gpu = torch.zeros_like(qs)
+            lse_gpu = torch.full((H, ns), float("-inf"), dtype=torch.float32, device=qs.device)
             if hp.s_max_gpu_len > 0:
-                o_gpu, lse_gpu = fa(
-                    q=qs, k=key_cache, v=value_cache,
-                    cu_seqlens_q=dp.s_cu, max_seqlen_q=1,
+                # Only rows with GPU tokens go to FlashAttention. For a row with
+                # seqused_k == 0, FA2's paged (split-KV) kernel exits early and
+                # writes its LSE at a padded-layout offset, i.e. over OTHER rows'
+                # LSE; the merge then silently drops their GPU partial.
+                # num_splits=1 also keeps FA off the split-KV combine path, so the
+                # LSE always comes from the regular [heads, total_q] epilogue.
+                rows = dp.s_gpu_rows
+                o_g, lse_g = fa(
+                    q=qs.index_select(0, rows), k=key_cache, v=value_cache,
+                    cu_seqlens_q=dp.s_gpu_cu, max_seqlen_q=1,
                     seqused_k=dp.s_gpu_lens, max_seqlen_k=hp.s_max_gpu_len,
                     softmax_scale=self.scale, causal=False,
                     block_table=dp.s_gpu_bt, softcap=self.logits_soft_cap,
-                    return_softmax_lse=True, fa_version=self.vllm_flash_attn_version,
+                    return_softmax_lse=True, num_splits=1,
+                    fa_version=self.vllm_flash_attn_version,
                 )
-                # Rows with no GPU tokens: force (0, -inf) so whatever FA left
-                # there cannot leak through the merge (NaN * 0 = NaN).
-                lse_gpu.masked_fill_(dp.s_gpu_empty[None, :], float("-inf"))
-                o_gpu.masked_fill_(dp.s_gpu_empty[:, None, None], 0.0)
-            else:
-                o_gpu = torch.zeros_like(qs)
-                lse_gpu = torch.full((H, ns), float("-inf"), device=qs.device)
+                o_gpu.index_copy_(0, rows, o_g)
+                lse_gpu.index_copy_(1, rows, lse_g.float())
         if hp.n_p_tok:
             q_p = query.index_select(0, dp.p_tok)
             o_p = fa(
