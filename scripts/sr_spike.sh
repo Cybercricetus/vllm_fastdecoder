@@ -26,17 +26,18 @@ python -m pytest tests -q
 
 echo "### 1. smoke: does a micro-batched run start and finish? A hang here is a deadlock."
 timeout 1800 python scripts/check_correctness.py --task tokens --model "$MODEL" \
-  --arms fastdecode_sr --limit 64 --max-tokens 64 \
+  --ref baseline_eager --arms fastdecode_sr --limit 64 --max-tokens 128 \
   --gpu-kv-gib 0.25 --cpu-kv-gib 8 --cpu-threads "$THREADS" \
   --outdir "$OUT/smoke" 2>&1 | tee "$OUT/smoke.log"
 grep -q "micro-batch runner enabled" "$OUT/smoke.log" \
   || { echo "FAIL: the micro-batch runner was never built"; exit 1; }
-grep "steps micro-batched" "$OUT/smoke.log" | tail -3 \
-  || echo "WARN: no micro-batching report yet (fewer than 50 steps?)"
+# the runner existing is not enough: some decode steps must actually be split
+grep -E "FastDecode S/R: [1-9][0-9]* of the last 50 steps micro-batched" "$OUT/smoke.log" | tail -3 \
+  || { echo "FAIL: no step was micro-batched"; exit 1; }
 
-echo "### 2. token-level correctness under heavy offload"
+echo "### 2. token-level correctness under heavy offload (eager reference and noise floor)"
 timeout 5400 python scripts/check_correctness.py --task tokens --model "$MODEL" \
-  --arms baseline,baseline_alt,fastdecode_eager,fastdecode_sr \
+  --ref baseline_eager --arms baseline_alt,fastdecode_eager,fastdecode_sr \
   --gpu-kv-gib 0.25 --cpu-kv-gib 8 --cpu-threads "$THREADS" --limit 128 \
   --outdir "$OUT/correctness" 2>&1 | tee "$OUT/correctness.txt"
 
