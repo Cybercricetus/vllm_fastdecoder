@@ -18,7 +18,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from fastdecode import backend, cpu_ops, plan, state
+from fastdecode import backend, cpu_ops, plan, sr, state
 
 # ----------------------------------------------------------------------------
 # CPU mocks of the GPU ops
@@ -254,6 +254,46 @@ def test_forward_split_matches_unified_attention(H, KVH, dtype, seed):
     assert torch.equal(gk, sc.ref_k[:G]) and torch.equal(gv, sc.ref_v[:G])
     assert torch.equal(sc.cpu_k.transpose(1, 2), sc.ref_k[G:])
     assert torch.equal(sc.cpu_v.transpose(1, 2), sc.ref_v[G:])
+
+
+def test_forward_split_overlap_path(monkeypatch):
+    """S/R spike: the CPU part runs as a job around the micro-batch handoff, in
+    micro-batch 1's own staging buffers, and gives the same result."""
+    from concurrent.futures import Future
+
+    calls = []
+
+    def submit(fn):
+        calls.append("submit")
+        fut = Future()
+        fut.set_result(fn())
+        return fut
+
+    monkeypatch.setattr(sr, "submit", submit)
+    monkeypatch.setattr(sr, "yield_to_other", lambda: calls.append("yield"))
+    monkeypatch.setattr(sr, "ubatch_id", lambda: 1)
+    st = state.PinnedStaging.__new__(state.PinnedStaging)
+    st._bufs, st._pin = {}, False
+    monkeypatch.setitem(state._STAGING_UBATCH, 1, st)
+
+    G, C, H, KVH, D, dtype = 10, 20, 8, 2, 64, torch.float32
+    sc = _scenario(REQS, G, C, H, KVH, D, dtype, 0)
+    hp = plan.build_host_plan(sc.qsl, sc.seq_lens, sc.bt, sc.slots, G, C, BS)
+    dp = plan.to_device(hp, sc.bt, "cpu")
+    state.STORE = state.CpuKVStore(
+        num_gpu_blocks=G, num_cpu_blocks=C, block_size=BS, num_kv_heads=KVH,
+        head_size=D, dtype=dtype, k={"l0": sc.cpu_k}, v={"l0": sc.cpu_v},
+    )
+    impl = _impl(H, KVH, D, sc.scale)
+    layer = SimpleNamespace(layer_name="l0", _k_scale=None, _v_scale=None)
+    output = torch.full_like(sc.query, float("nan"))
+    impl._forward_split(layer, sc.query, sc.key, sc.value, sc.kv_cache, dp, output,
+                        overlap=True)
+
+    torch.testing.assert_close(output.double(), sc.ref, atol=1e-5, rtol=1e-5)
+    assert calls == ["submit", "yield"]
+    assert {"q", "o", "lse"} <= set(st._bufs)
+    assert not state._STAGING._bufs  # micro-batch 0's buffers untouched
 
 
 def test_engine_core_patch(monkeypatch):
