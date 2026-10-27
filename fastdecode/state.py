@@ -96,7 +96,9 @@ class PinnedStaging:
     Reused across layers: every layer finishes its CPU work (and enqueues its
     H2D copies) before the next layer's D2H copies are enqueued on the same
     stream, and the CPU only touches a buffer after waiting on the event that
-    follows those copies, so a single set of buffers is race-free.
+    follows those copies, so a single set of buffers is race-free. That holds per
+    micro-batch only: with S/R micro-batching the two micro-batches of a step
+    overlap, so each gets its own set (staging(ubatch)).
     """
 
     def __init__(self) -> None:
@@ -125,10 +127,16 @@ class PinnedStaging:
 
 
 _STAGING: PinnedStaging | None = None
+_STAGING_UBATCH: dict[int, PinnedStaging] = {}  # micro-batches 1.. (S/R spike)
 
 
-def staging() -> PinnedStaging:
+def staging(ubatch: int = 0) -> PinnedStaging:
     global _STAGING
+    if ubatch:
+        st = _STAGING_UBATCH.get(ubatch)
+        if st is None:
+            st = _STAGING_UBATCH[ubatch] = PinnedStaging()
+        return st
     if _STAGING is None:
         _STAGING = PinnedStaging()
     return _STAGING
