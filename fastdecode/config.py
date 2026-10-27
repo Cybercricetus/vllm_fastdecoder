@@ -11,6 +11,7 @@ FASTDECODE_CPU_THREADS  OpenMP threads for the CPU attention kernel
                         (default: OpenMP default; set it to your P-core count)
 FASTDECODE_MARCH        -march for the JIT build (default "native")
 FASTDECODE_STATS        "1" to log per-step GPU/CPU token split every 50 steps
+FASTDECODE_SR           "1" for the S/R pipeline spike (see fastdecode/sr.py)
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ import os
 ENV_CPU_BLOCKS = "FASTDECODE_CPU_BLOCKS"
 ENV_CPU_KV_GB = "FASTDECODE_CPU_KV_GB"
 ENV_STATS = "FASTDECODE_STATS"
+ENV_SR = "FASTDECODE_SR"
 
 
 def enabled() -> bool:
@@ -28,6 +30,10 @@ def enabled() -> bool:
 
 def stats_enabled() -> bool:
     return os.environ.get(ENV_STATS, "0") not in ("", "0", "false", "False")
+
+
+def sr_enabled() -> bool:
+    return enabled() and os.environ.get(ENV_SR, "0") not in ("", "0", "false", "False")
 
 
 def kv_bytes_per_block(kv_cache_config) -> int:
